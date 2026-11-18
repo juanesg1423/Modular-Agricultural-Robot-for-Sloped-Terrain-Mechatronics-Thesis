@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>HMI - Robot agrícola</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 18px; background: #111827; color: #e5e7eb; }
+    main { max-width: 1100px; margin: auto; }
+    h1 { font-size: 1.35rem; margin: 0 0 14px; }
+    h2 { font-size: 1rem; margin: 22px 0 10px; color: #cbd5e1; }
+    .bar { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }
+    button { border:0; border-radius:8px; padding:10px 14px; font-weight:700; cursor:pointer; }
+    button:disabled { opacity:.55; cursor:default; }
+    #connect { background:#22c55e; color:#052e16; }
+    #clear { background:#374151; color:white; }
+    #bleStatus { padding:9px 12px; border-radius:8px; background:#1f2937; margin-bottom:14px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:10px; }
+    .card { min-height:88px; padding:13px; border:1px solid #374151; border-radius:10px; background:#1f2937; }
+    .label { display:block; margin-bottom:7px; color:#9ca3af; font-size:.82rem; }
+    .value { font-size:1.05rem; font-weight:700; }
+    .sub { margin-top:5px; color:#9ca3af; font-size:.78rem; overflow-wrap:anywhere; }
+    .ok { color:#4ade80; }
+    .bad { color:#f87171; }
+    .warn { color:#fbbf24; }
+    .muted { color:#9ca3af; }
+    #console { height:42vh; min-height:230px; overflow:auto; white-space:pre-wrap;
+      overflow-wrap:anywhere; padding:14px; border:1px solid #374151; border-radius:10px;
+      background:#030712; color:#d1fae5; font:14px/1.45 ui-monospace,SFMono-Regular,Consolas,monospace; }
+    .mode-tag { display:inline-block; margin:8px 6px 0 0; padding:4px 8px; border-radius:999px; background:#374151; color:#9ca3af; font-size:.78rem; }
+    .mode-tag.active { background:#14532d; color:#86efac; outline:1px solid #22c55e; }
+    .hint { color:#9ca3af; font-size:.86rem; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>HMI · Estado del robot</h1>
+  <div class="bar">
+    <button id="connect">Conectar ESP32</button>
+    <button id="clear">Limpiar consola</button>
+  </div>
+  <div id="bleStatus">HMI: desconectada</div>
+
+  <h2>Control y operación</h2>
+  <section class="grid">
+    <article class="card"><span class="label">DualSense</span><span id="controller" class="value muted">Esperando reporte</span></article>
+    <article class="card"><span class="label">Modo activo</span><span id="mode" class="value muted">Sin reporte</span><div id="modeDetail" class="sub">Esperando selección</div><span id="modeHeight" class="mode-tag">ALTURA</span><span id="modeDrive" class="mode-tag">DESPLAZAMIENTO</span></article>
+    <article class="card"><span class="label">Sistema</span><span id="armed" class="value muted">Estado desconocido</span><div id="armedDetail" class="sub">Se actualiza con mensajes de Serial</div></article>
+    <article class="card"><span class="label">Último evento</span><span id="event" class="value muted">Esperando datos</span></article>
+  </section>
+
+  <h2>Motores Hub · configuración CANopen</h2>
+  <section class="grid" id="hubGrid"></section>
+
+  <h2>SteadyWin · reportes recibidos</h2>
+  <section class="grid" id="steadyGrid"></section>
+
+  <h2>Salida Serial completa</h2>
+  <pre id="console" aria-live="polite"></pre>
+  <p class="hint">Los estados se interpretan a partir de los mensajes que el sketch envía por Serial. La HMI comienza a recibirlos al conectarse; no muestra mensajes anteriores a la conexión.</p>
+</main>
+<script>
+(() => {
+  const SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+  const TX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+  const bleStatusEl = document.getElementById('bleStatus');
+  const consoleEl = document.getElementById('console');
+  const connectBtn = document.getElementById('connect');
+  const controllerEl = document.getElementById('controller');
+  const modeEl = document.getElementById('mode');
+  const modeDetailEl = document.getElementById('modeDetail');
+  const modeHeightEl = document.getElementById('modeHeight');
+  const modeDriveEl = document.getElementById('modeDrive');
+  const armedEl = document.getElementById('armed');
+  const armedDetailEl = document.getElementById('armedDetail');
+  const eventEl = document.getElementById('event');
+  const decoder = new TextDecoder('utf-8');
+  const hubStates = new Map();
+  const steadyStates = new Map();
+  let device = null;
+  let txCharacteristic = null;
+  let partialLine = '';
+  let currentMode = 'Sin reporte';
+  let emergency = false;
+
+  function makeNodeCard(title, initial) {
+    const card = document.createElement('article');
+    card.className = 'card';
+    const label = document.createElement('span');
+    label.className = 'label'; label.textContent = title;
+    const value = document.createElement('span');
+    value.className = 'value muted'; value.textContent = initial;
+    const sub = document.createElement('div'); sub.className = 'sub';
+    card.append(label, value, sub);
+    return { card, value, sub };
+  }
+
+  const hubCards = new Map();
+  const hubGrid = document.getElementById('hubGrid');
+  for (let id = 1; id <= 4; id++) {
+    const parts = makeNodeCard('Hub nodo ' + id, 'Sin reporte');
+    parts.sub.textContent = 'Esperando resultado de configuración';
+    hubGrid.appendChild(parts.card);
+    hubCards.set(id, parts);
+  }
+
+  const steadyCards = new Map();
+  const steadyGrid = document.getElementById('steadyGrid');
+  for (const id of [11, 12, 13, 14]) {
+    const parts = makeNodeCard('SteadyWin ID ' + id, 'Sin reporte');
+    parts.sub.textContent = 'Esperando estado o respuesta CAN';
+    steadyGrid.appendChild(parts.card);
+    steadyCards.set(id, parts);
+  }
+
+  function setClass(el, className) { el.className = 'value ' + className; }
+
+  function showHub(id, state, detail) {
+    hubStates.set(id, { state, detail });
+    const card = hubCards.get(id);
+    if (!card) return;
+    card.value.textContent = state;
+    card.sub.textContent = detail || '';
+    setClass(card.value, state === 'OK' ? 'ok' : state === 'ERROR' ? 'bad' : 'warn');
+  }
+
+  function showSteady(id, state, detail, kind) {
+    steadyStates.set(id, { state, detail });
+    const card = steadyCards.get(id);
+    if (!card) return;
+    card.value.textContent = state;
+    card.sub.textContent = detail || '';
+    setClass(card.value, kind === 'error' ? 'bad' : kind === 'ok' ? 'ok' : 'warn');
+  }
+
+  function appendText(text) {
+    consoleEl.textContent += text;
+    if (consoleEl.textContent.length > 100000) {
+      consoleEl.textContent = consoleEl.textContent.slice(-80000);
+    }
+    consoleEl.scrollTop = consoleEl.scrollHeight;
+
+    const combined = partialLine + text;
+    const lines = combined.split(/\r?\n/);
+    partialLine = lines.pop() || '';
+    for (const line of lines) parseLine(line.trim());
+  }
+
+  function parseLine(line) {
+    if (!line) return;
+    if (line.includes('Esperando DualSense')) {
+      controllerEl.textContent = 'Desconectado'; setClass(controllerEl, 'warn');
+      armedEl.textContent = 'DESARMADO'; setClass(armedEl, 'warn');
+      armedDetailEl.textContent = 'Esperando conexión y armado';
+    }
+    if (line.includes('DualSense conectado.')) {
+      controllerEl.textContent = 'Conectado'; setClass(controllerEl, 'ok');
+      eventEl.textContent = 'DualSense conectado'; setClass(eventEl, 'ok');
+    }
+    if (line.includes('DualSense desconectado')) {
+      controllerEl.textContent = 'Desconectado'; setClass(controllerEl, 'bad');
+      currentMode = 'Sin modo'; updateMode();
+      armedEl.textContent = 'Desarmado'; setClass(armedEl, 'warn');
+      armedDetailEl.textContent = 'Parada por pérdida del mando';
+      emergency = false;
+      eventEl.textContent = 'Se perdió conexión con el mando'; setClass(eventEl, 'bad');
+    }
+    if (line.includes('Modo ALTURA seleccionado.')) {
+      currentMode = 'ALTURA'; emergency = false; updateMode();
+      eventEl.textContent = 'Modo altura seleccionado'; setClass(eventEl, 'ok');
+    }
+    if (line.includes('Modo DESPLAZAMIENTO seleccionado.')) {
+      currentMode = 'DESPLAZAMIENTO'; emergency = false; updateMode();
+      eventEl.textContent = 'Modo desplazamiento seleccionado'; setClass(eventEl, 'ok');
+    }
+    if (line.includes('Sistema ARMADO.')) {
+      armedEl.textContent = 'ARMADO'; setClass(armedEl, 'ok');
+      armedDetailEl.textContent = 'Mantén R2 para ordenar movimiento';
+      eventEl.textContent = 'Sistema armado'; setClass(eventEl, 'ok');
+    }
+    if (line.includes('Sistema DESARMADO.')) {
+      armedEl.textContent = 'DESARMADO'; setClass(armedEl, 'warn');
+      armedDetailEl.textContent = 'Motores sin orden de movimiento';
+      eventEl.textContent = 'Sistema desarmado'; setClass(eventEl, 'warn');
+    }
+    if (line.includes('PARADA DE EMERGENCIA')) {
+      emergency = true;
+      armedEl.textContent = 'PARADA'; setClass(armedEl, 'bad');
+      armedDetailEl.textContent = 'Requiere seleccionar modo y armar de nuevo';
+      currentMode = 'Sin modo'; updateMode();
+      eventEl.textContent = 'Parada de emergencia'; setClass(eventEl, 'bad');
+    }
+    if (line.includes('Motores detenidos. Selecciona un modo')) {
+      emergency = true;
+      armedEl.textContent = 'PARADA'; setClass(armedEl, 'bad');
+      currentMode = 'Sin modo'; updateMode();
+    }
+    if (line.includes('Hub nodo ')) {
+      const m = line.match(/Hub nodo\s+(\d+)\s+(OK|ERROR)/i);
+      if (m) showHub(Number(m[1]), m[2].toUpperCase(), m[2].toUpperCase() === 'OK' ? 'Configuración CANopen completada' : 'Falló la configuración CANopen');
+    }
+    if (line.includes('Error TX SteadyWin, ID ')) {
+      const m = line.match(/Error TX SteadyWin, ID\s+(\d+):?\s*(.*)/i);
+      if (m) showSteady(Number(m[1]), 'Error TX', m[2] || 'No se pudo enviar el mensaje CAN', 'error');
+    }
+    if (line.includes('SteadyWin ID ') && line.includes('Falla: 0x')) {
+      const m = line.match(/SteadyWin ID\s+(\d+).*Bus:\s*([\d.]+)\s*V.*Corriente:\s*([\d.]+)\s*A.*Falla:\s*0x([\da-f]+)/i);
+      if (m) {
+        const fault = parseInt(m[4], 16);
+        showSteady(Number(m[1]), fault === 0 ? 'Reporte recibido · sin falla' : 'Falla 0x' + m[4].toUpperCase(), 'Bus ' + m[2] + ' V · Corriente ' + m[3] + ' A', fault === 0 ? 'ok' : 'error');
+      }
+    }
+    if (line.includes('Respuesta C1 ID ')) {
+      const m = line.match(/Respuesta C1 ID\s+(\d+).*velocidad:\s*([\d.-]+)\s*RPM/i);
+      if (m) showSteady(Number(m[1]), 'Respuesta recibida', 'Velocidad reportada: ' + m[2] + ' RPM', 'ok');
+    }
+    if (line.includes('obstáculo') || line.includes('Obstáculo')) {
+      eventEl.textContent = 'Obstáculo detectado'; setClass(eventEl, 'bad');
+    }
+    if (line.includes('Error CANopen') || line.includes('ERROR: uno o más hubs')) {
+      eventEl.textContent = 'Error de comunicación CANopen'; setClass(eventEl, 'bad');
+    }
+  }
+
+  function updateMode() {
+    modeEl.textContent = currentMode;
+    modeHeightEl.classList.toggle('active', currentMode === 'ALTURA');
+    modeDriveEl.classList.toggle('active', currentMode === 'DESPLAZAMIENTO');
+    if (currentMode === 'ALTURA' || currentMode === 'DESPLAZAMIENTO') {
+      setClass(modeEl, 'ok');
+      modeDetailEl.textContent = currentMode === 'ALTURA' ? 'Control de los cuatro SteadyWin' : 'Tracción con los cuatro motores Hub';
+    } else {
+      setClass(modeEl, emergency ? 'bad' : 'muted');
+      modeDetailEl.textContent = emergency ? 'Modo desactivado por parada de emergencia' : 'Altura / desplazamiento';
+    }
+  }
+
+  function onNotification(event) {
+    appendText(decoder.decode(event.target.value, { stream: true }));
+  }
+
+  async function connect() {
+    if (!('bluetooth' in navigator)) {
+      bleStatusEl.textContent = 'Este navegador no ofrece Web Bluetooth. Usa Chrome o Edge en Android o escritorio.';
+      return;
+    }
+    try {
+      connectBtn.disabled = true;
+      bleStatusEl.textContent = 'Buscando Robot_Agricola_HMI…';
+      device = await navigator.bluetooth.requestDevice({
+        filters: [{ name: 'Robot_Agricola_HMI' }],
+        optionalServices: [SERVICE]
+      });
+      device.addEventListener('gattserverdisconnected', () => {
+        txCharacteristic = null;
+        connectBtn.disabled = false;
+        bleStatusEl.textContent = 'HMI: desconectada de la ESP32';
+      });
+
+      bleStatusEl.textContent = 'Conectando…';
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(SERVICE);
+      txCharacteristic = await service.getCharacteristic(TX);
+      await txCharacteristic.startNotifications();
+      txCharacteristic.addEventListener('characteristicvaluechanged', onNotification);
+      bleStatusEl.textContent = 'HMI: conectada a ' + (device.name || 'ESP32') + ' · recibiendo Serial';
+      appendText('\n[HMI conectada]\n');
+    } catch (error) {
+      connectBtn.disabled = false;
+      bleStatusEl.textContent = 'No se pudo conectar: ' + error.message;
+    }
+  }
+
+  connectBtn.addEventListener('click', connect);
+  document.getElementById('clear').addEventListener('click', () => { consoleEl.textContent = ''; });
+})();
+</script>
+</body>
+</html>
